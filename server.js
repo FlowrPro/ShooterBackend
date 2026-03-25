@@ -2,38 +2,26 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import pg from 'pg';
+import { createClient } from '@supabase/supabase-js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = 'your-secret-key-change-in-production';
+
+// Supabase connection
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eraudtprdpnsgrhiipto.supabase.co';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('❌ SUPABASE_SERVICE_ROLE_KEY environment variable is missing!');
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-
-// PostgreSQL Connection
-const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://user:password@localhost:5432/moborr'
-});
-
-// Initialize Database
-async function initDB() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        avatar TEXT DEFAULT '😎',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-    console.log('✅ Database initialized');
-  } catch (error) {
-    console.error('Database init error:', error);
-  }
-}
 
 // ============================================
 // AUTH ROUTES
@@ -52,33 +40,50 @@ app.post('/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
-    // Check if user exists
-    const existingUser = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    if (existingUser.rows.length > 0) {
+    // Check if username exists
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('username', username)
+      .single();
+
+    if (existingUser) {
       return res.status(400).json({ error: 'Username already taken' });
     }
 
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Create user
-    const result = await pool.query(
-      'INSERT INTO users (username, password, avatar) VALUES ($1, $2, $3) RETURNING id, username, avatar',
-      [username, hashedPassword, '😎']
-    );
+    // Insert user
+    const { data: newUser, error } = await supabase
+      .from('users')
+      .insert([{
+        username,
+        password: hashedPassword,
+        avatar: '😎'
+      }])
+      .select()
+      .single();
 
-    const user = result.rows[0];
+    if (error) {
+      console.error('Supabase insert error:', error);
+      return res.status(500).json({ error: 'Registration failed' });
+    }
 
     // Generate JWT token
-    const token = jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign(
+      { userId: newUser.id, username: newUser.username },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
     res.status(201).json({
       success: true,
       token,
       user: {
-        id: user.id,
-        username: user.username,
-        avatar: user.avatar
+        id: newUser.id,
+        username: newUser.username,
+        avatar: newUser.avatar
       }
     });
   } catch (error) {
@@ -97,10 +102,13 @@ app.post('/auth/login', async (req, res) => {
     }
 
     // Find user
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    const user = result.rows[0];
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('username', username)
+      .single();
 
-    if (!user) {
+    if (error || !user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
@@ -111,7 +119,11 @@ app.post('/auth/login', async (req, res) => {
     }
 
     // Generate JWT token
-    const token = jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign(
+      { userId: user.id, username: user.username },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
     res.json({
       success: true,
@@ -155,9 +167,6 @@ app.get('/health', (req, res) => {
 });
 
 // Start server
-(async () => {
-  await initDB();
-  app.listen(PORT, () => {
-    console.log(`🚀 Moborr Backend running on http://localhost:${PORT}`);
-  });
-})();
+app.listen(PORT, () => {
+  console.log(`🚀 Moborr Backend running on http://localhost:${PORT}`);
+});
