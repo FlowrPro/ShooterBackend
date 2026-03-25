@@ -16,6 +16,6 @@
     "@supabase/supabase-js": "^2.38.4"
   },
   "engines": {
-    "node": "18.x"
+  "node": "20.x"
   }
 }
