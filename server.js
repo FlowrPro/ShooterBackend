@@ -333,6 +333,21 @@ app.get('/auth/me', (req, res) => {
 // MATCHMAKING ROUTES
 // ============================================
 
+// Force cleanup old match (for development/testing)
+app.post('/match/cleanup', verifyToken, (req, res) => {
+  try {
+    if (playerMatches.has(req.user.userId)) {
+      const oldMatchId = playerMatches.get(req.user.userId);
+      removePlayerFromMatch(req.user.userId, oldMatchId);
+      console.log(`Cleaned up old match for user ${req.user.userId}`);
+    }
+    res.json({ success: true, message: 'Cleanup completed' });
+  } catch (error) {
+    console.error('Cleanup error:', error);
+    res.status(500).json({ error: 'Cleanup failed' });
+  }
+});
+
 // Find or create match
 app.post('/match/queue', verifyToken, (req, res) => {
   try {
