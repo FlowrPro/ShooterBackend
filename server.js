@@ -28,7 +28,7 @@ app.use(express.json());
 // ============================================
 
 const activeMatches = new Map(); // matchId -> match data
-const playerQueues = new Map(); // region -> array of queued players
+const playerQueues = new Map(); // region -> array of queued players waiting
 const playerMatches = new Map(); // userId -> matchId
 const matchTimeouts = new Map(); // matchId -> timeout ID
 
@@ -75,15 +75,17 @@ function verifyToken(req, res, next) {
 
 function createMatch(region, initialPlayer) {
   const matchId = generateMatchId();
+  const playerId = generatePlayerId();
+  
   const match = {
     id: matchId,
     region: region,
-    players: [initialPlayer],
+    players: [{ ...initialPlayer, id: playerId }],
     status: 'active', // active, ended
     createdAt: Date.now(),
     gameState: {
       players: {
-        [initialPlayer.id]: {
+        [playerId]: {
           userId: initialPlayer.userId,
           username: initialPlayer.username,
           hp: 100,
@@ -106,21 +108,34 @@ function createMatch(region, initialPlayer) {
   activeMatches.set(matchId, match);
   playerMatches.set(initialPlayer.userId, matchId);
 
-  // Auto-end match after 5 minutes
+  // Auto-end match after duration
   const timeout = setTimeout(() => {
     endMatch(matchId);
   }, MATCH_DURATION);
 
   matchTimeouts.set(matchId, timeout);
 
+  console.log(`✅ Created new match ${matchId} in region ${region} with player ${initialPlayer.username}`);
   return match;
+}
+
+function findAvailableMatch(region) {
+  for (const [matchId, match] of activeMatches.entries()) {
+    if (match.region === region && match.status === 'active' && match.players.length < MATCH_SIZE) {
+      return match;
+    }
+  }
+  return null;
 }
 
 function addPlayerToMatch(matchId, player) {
   const match = activeMatches.get(matchId);
-  if (!match) return false;
+  if (!match) return null;
 
-  if (match.players.length >= MATCH_SIZE) return false;
+  if (match.players.length >= MATCH_SIZE) {
+    console.log(`❌ Match ${matchId} is full`);
+    return null;
+  }
 
   const playerId = generatePlayerId();
   match.players.push({ ...player, id: playerId });
@@ -132,7 +147,7 @@ function addPlayerToMatch(matchId, player) {
     hp: 100,
     kills: 0,
     deaths: 0,
-    position: { x: 0, y: 0, z: 0 },
+    position: { x: Math.random() * 20 - 10, y: 1.6, z: Math.random() * 20 - 10 },
     rotation: { x: 0, y: 0 },
     weapon: 'assault-rifle',
     ammo: 30,
@@ -141,7 +156,8 @@ function addPlayerToMatch(matchId, player) {
     isScoped: false
   };
 
-  return playerId;
+  console.log(`✅ Added player ${player.username} to match ${matchId}. Players in match: ${match.players.length}/${MATCH_SIZE}`);
+  return { matchId, playerId };
 }
 
 function endMatch(matchId) {
@@ -162,19 +178,13 @@ function endMatch(matchId) {
     matchTimeouts.delete(matchId);
   }
 
+  console.log(`⏹️ Match ${matchId} ended`);
+
   // Remove from active matches after delay
   setTimeout(() => {
     activeMatches.delete(matchId);
+    console.log(`🗑️ Match ${matchId} removed from active matches`);
   }, MATCH_CLEANUP_DELAY);
-}
-
-function findAvailableMatch(region) {
-  for (const [matchId, match] of activeMatches.entries()) {
-    if (match.region === region && match.status === 'active' && match.players.length < MATCH_SIZE) {
-      return match;
-    }
-  }
-  return null;
 }
 
 function removePlayerFromMatch(userId, matchId) {
@@ -183,7 +193,9 @@ function removePlayerFromMatch(userId, matchId) {
 
   const playerIndex = match.players.findIndex(p => p.userId === userId);
   if (playerIndex > -1) {
+    const playerName = match.players[playerIndex].username;
     match.players.splice(playerIndex, 1);
+    console.log(`✅ Removed player ${playerName} from match ${matchId}. Players remaining: ${match.players.length}`);
   }
 
   playerMatches.delete(userId);
@@ -348,7 +360,7 @@ app.post('/match/cleanup', verifyToken, (req, res) => {
   }
 });
 
-// Find or create match
+// Find or create match - IMPROVED QUEUEING SYSTEM
 app.post('/match/queue', verifyToken, (req, res) => {
   try {
     const { region } = req.body;
@@ -376,28 +388,52 @@ app.post('/match/queue', verifyToken, (req, res) => {
       username: req.user.username
     };
 
-    // Try to find available match
+    // Try to find available match in region
     let match = findAvailableMatch(region);
 
     if (match) {
       // Add player to existing match
-      const playerId = addPlayerToMatch(match.id, player);
+      const result = addPlayerToMatch(match.id, player);
+      if (!result) {
+        // Match became full, create new one
+        match = createMatch(region, player);
+        return res.json({
+          success: true,
+          matchId: match.id,
+          playerId: Object.keys(match.gameState.players)[0],
+          gameState: match.gameState,
+          match: {
+            id: match.id,
+            players: match.players,
+            region: match.region
+          }
+        });
+      }
+
       return res.json({
         success: true,
-        matchId: match.id,
-        playerId: playerId,
-        gameState: match.gameState
+        matchId: result.matchId,
+        playerId: result.playerId,
+        gameState: match.gameState,
+        match: {
+          id: match.id,
+          players: match.players,
+          region: match.region
+        }
       });
     } else {
-      // Create new match
-      const newPlayer = { ...player, id: generatePlayerId() };
-      match = createMatch(region, newPlayer);
-      const playerId = newPlayer.id;
+      // No available match, create new one
+      match = createMatch(region, player);
       return res.json({
         success: true,
         matchId: match.id,
-        playerId: playerId,
-        gameState: match.gameState
+        playerId: Object.keys(match.gameState.players)[0],
+        gameState: match.gameState,
+        match: {
+          id: match.id,
+          players: match.players,
+          region: match.region
+        }
       });
     }
   } catch (error) {
@@ -590,19 +626,48 @@ app.post('/match/:matchId/leave', verifyToken, (req, res) => {
 });
 
 // ============================================
+// ADMIN ROUTES (for debugging)
+// ============================================
+
+app.get('/admin/matches', (req, res) => {
+  const matchesInfo = Array.from(activeMatches.values()).map(match => ({
+    id: match.id,
+    region: match.region,
+    status: match.status,
+    players: match.players.length,
+    maxPlayers: MATCH_SIZE,
+    playerList: match.players.map(p => p.username)
+  }));
+
+  res.json({
+    totalMatches: activeMatches.size,
+    totalPlayers: Array.from(activeMatches.values()).reduce((sum, m) => sum + m.players.length, 0),
+    matches: matchesInfo
+  });
+});
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  const stats = {
+    status: 'ok',
     message: 'Moborr backend is running',
     activeMatches: activeMatches.size,
-    totalPlayers: Array.from(activeMatches.values()).reduce((sum, match) => sum + match.players.length, 0)
-  });
+    totalPlayers: Array.from(activeMatches.values()).reduce((sum, match) => sum + match.players.length, 0),
+    matchStats: Array.from(activeMatches.values()).map(m => ({
+      id: m.id,
+      players: m.players.length,
+      maxPlayers: MATCH_SIZE,
+      isFull: m.players.length >= MATCH_SIZE
+    }))
+  };
+  res.json(stats);
 });
 
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Moborr Backend running on http://localhost:${PORT}`);
+  console.log(`📊 Admin endpoint: GET http://localhost:${PORT}/admin/matches`);
 });
