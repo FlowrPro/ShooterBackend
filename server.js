@@ -27,7 +27,7 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Create HTTP server (needed for WebSocket)
-const server = createHTTP(app);
+const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Middleware
