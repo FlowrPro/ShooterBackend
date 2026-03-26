@@ -1,13 +1,20 @@
+// ===========================
+// Moborr.io Combined Server
+// Auth + Game in one Render deploy
+// ===========================
+
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { createClient } from '@supabase/supabase-js';
+import { WebSocketServer } from 'ws';
+import { createServer } from 'http';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Supabase connection
+// Secrets
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eraudtprdpnsgrhiipto.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
@@ -19,15 +26,33 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// Create HTTP server (needed for WebSocket)
+const server = createHTTP(app);
+const wss = new WebSocketServer({ server });
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 
 // ============================================
+// GAME CONFIG & STATE
+// ============================================
+
+const GAME_CONFIG = {
+  MAP_WIDTH: 10000,
+  MAP_HEIGHT: 10000,
+  PLAYER_RADIUS: 25,
+  PLAYER_SPEED: 5,
+  TICK_RATE: 60,
+  TICK_DURATION: 1000 / 60
+};
+
+const players = new Map(); // playerId -> { id, username, x, y, inputState, ws }
+
+// ============================================
 // AUTH ROUTES
 // ============================================
 
-// Register
 app.post('/auth/register', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -40,21 +65,18 @@ app.post('/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
-    // Check if username exists
     const { data: existingUser } = await supabase
       .from('users')
       .select('id')
       .eq('username', username)
-      .single();
+      .maybeSingle();
 
     if (existingUser) {
       return res.status(400).json({ error: 'Username already taken' });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Insert user
     const { data: newUser, error } = await supabase
       .from('users')
       .insert([{
@@ -70,7 +92,6 @@ app.post('/auth/register', async (req, res) => {
       return res.status(500).json({ error: 'Registration failed' });
     }
 
-    // Generate JWT token
     const token = jwt.sign(
       { userId: newUser.id, username: newUser.username },
       JWT_SECRET,
@@ -92,7 +113,6 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-// Login
 app.post('/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -101,24 +121,21 @@ app.post('/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Username and password required' });
     }
 
-    // Find user
     const { data: user, error } = await supabase
       .from('users')
       .select('*')
       .eq('username', username)
-      .single();
+      .maybeSingle();
 
     if (error || !user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Check password
     const passwordMatch = await bcrypt.compare(password, user.password);
     if (!passwordMatch) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Generate JWT token
     const token = jwt.sign(
       { userId: user.id, username: user.username },
       JWT_SECRET,
@@ -140,7 +157,6 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// Get current user (verify token)
 app.get('/auth/me', (req, res) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
@@ -159,14 +175,176 @@ app.get('/auth/me', (req, res) => {
 });
 
 // ============================================
+// GAME SERVER (WebSocket)
+// ============================================
+
+function updatePlayerPhysics() {
+  players.forEach((player) => {
+    const input = player.inputState;
+    const speed = GAME_CONFIG.PLAYER_SPEED;
+
+    if (input.w) {
+      player.y = Math.max(GAME_CONFIG.PLAYER_RADIUS, player.y - speed);
+    }
+    if (input.s) {
+      player.y = Math.min(GAME_CONFIG.MAP_HEIGHT - GAME_CONFIG.PLAYER_RADIUS, player.y + speed);
+    }
+    if (input.a) {
+      player.x = Math.max(GAME_CONFIG.PLAYER_RADIUS, player.x - speed);
+    }
+    if (input.d) {
+      player.x = Math.min(GAME_CONFIG.MAP_WIDTH - GAME_CONFIG.PLAYER_RADIUS, player.x + speed);
+    }
+  });
+}
+
+function broadcastGameState() {
+  const gameState = {
+    type: 'playerUpdate',
+    players: Array.from(players.values()).map((p) => ({
+      id: p.id,
+      username: p.username,
+      x: p.x,
+      y: p.y
+    }))
+  };
+
+  players.forEach((player) => {
+    if (player.ws.readyState === 1) {
+      player.ws.send(JSON.stringify(gameState));
+    }
+  });
+}
+
+function gameServerLoop() {
+  updatePlayerPhysics();
+  broadcastGameState();
+}
+
+setInterval(gameServerLoop, GAME_CONFIG.TICK_DURATION);
+
+// WebSocket connection handler
+wss.on('connection', (ws) => {
+  console.log('🟢 New WebSocket connection');
+
+  let player = null;
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data);
+
+      if (message.type === 'join') {
+        try {
+          const decoded = jwt.verify(message.token, JWT_SECRET);
+          const playerId = decoded.userId;
+
+          if (players.has(playerId)) {
+            player = players.get(playerId);
+            player.ws = ws;
+          } else {
+            player = {
+              id: playerId,
+              username: message.username,
+              x: GAME_CONFIG.MAP_WIDTH / 2 + Math.random() * 100 - 50,
+              y: GAME_CONFIG.MAP_HEIGHT / 2 + Math.random() * 100 - 50,
+              inputState: { w: false, a: false, s: false, d: false },
+              ws
+            };
+            players.set(playerId, player);
+          }
+
+          const gameState = {
+            type: 'gameState',
+            you: {
+              id: player.id,
+              username: player.username,
+              x: player.x,
+              y: player.y
+            },
+            players: Array.from(players.values())
+              .filter((p) => p.id !== playerId)
+              .map((p) => ({
+                id: p.id,
+                username: p.username,
+                x: p.x,
+                y: p.y
+              }))
+          };
+
+          ws.send(JSON.stringify(gameState));
+
+          const joinMessage = {
+            type: 'playerJoined',
+            playerId: player.id,
+            username: player.username,
+            x: player.x,
+            y: player.y
+          };
+
+          players.forEach((p) => {
+            if (p.id !== playerId && p.ws.readyState === 1) {
+              p.ws.send(JSON.stringify(joinMessage));
+            }
+          });
+
+          console.log(`✅ Player ${player.username} joined. Total: ${players.size}`);
+        } catch (error) {
+          console.error('Token verification failed:', error);
+          ws.close(1008, 'Unauthorized');
+        }
+      } else if (message.type === 'move') {
+        if (player) {
+          player.inputState = {
+            w: message.w === true,
+            a: message.a === true,
+            s: message.s === true,
+            d: message.d === true
+          };
+        }
+      }
+    } catch (error) {
+      console.error('WebSocket message error:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    if (player) {
+      console.log(`👋 Player ${player.username} disconnected`);
+
+      const leftMessage = {
+        type: 'playerLeft',
+        playerId: player.id
+      };
+
+      players.forEach((p) => {
+        if (p.id !== player.id && p.ws.readyState === 1) {
+          p.ws.send(JSON.stringify(leftMessage));
+        }
+      });
+
+      players.delete(player.id);
+    }
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Moborr backend is running' });
+  res.json({ 
+    status: 'ok', 
+    message: 'Moborr server running',
+    playersOnline: players.size
+  });
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Moborr Backend running on http://localhost:${PORT}`);
+server.listen(PORT, () => {
+  console.log(`🚀 Moborr Server running on http://localhost:${PORT}`);
+  console.log(`📡 WebSocket available at ws://localhost:${PORT}`);
 });
