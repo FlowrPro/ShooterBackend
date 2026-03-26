@@ -30,11 +30,12 @@ app.use(express.json());
 const activeMatches = new Map(); // matchId -> match data
 const playerQueues = new Map(); // region -> array of queued players
 const playerMatches = new Map(); // userId -> matchId
+const matchTimeouts = new Map(); // matchId -> timeout ID
 
 const REGIONS = ['north-america', 'europe', 'asia'];
 const MATCH_SIZE = 8; // Max players per match
 const MATCH_DURATION = 5 * 60 * 1000; // 5 minutes
-const QUEUE_TIMEOUT = 30 * 1000; // 30 seconds queue timeout
+const MATCH_CLEANUP_DELAY = 10 * 1000; // 10 seconds after match ends
 
 // Initialize empty queues for each region
 REGIONS.forEach(region => {
@@ -106,9 +107,11 @@ function createMatch(region, initialPlayer) {
   playerMatches.set(initialPlayer.userId, matchId);
 
   // Auto-end match after 5 minutes
-  setTimeout(() => {
+  const timeout = setTimeout(() => {
     endMatch(matchId);
   }, MATCH_DURATION);
+
+  matchTimeouts.set(matchId, timeout);
 
   return match;
 }
@@ -119,10 +122,10 @@ function addPlayerToMatch(matchId, player) {
 
   if (match.players.length >= MATCH_SIZE) return false;
 
-  match.players.push(player);
+  const playerId = generatePlayerId();
+  match.players.push({ ...player, id: playerId });
   playerMatches.set(player.userId, matchId);
 
-  const playerId = generatePlayerId();
   match.gameState.players[playerId] = {
     userId: player.userId,
     username: player.username,
@@ -152,10 +155,17 @@ function endMatch(matchId) {
     playerMatches.delete(player.userId);
   });
 
-  // Remove from active matches after 10 seconds
+  // Clear timeout
+  const timeout = matchTimeouts.get(matchId);
+  if (timeout) {
+    clearTimeout(timeout);
+    matchTimeouts.delete(matchId);
+  }
+
+  // Remove from active matches after delay
   setTimeout(() => {
     activeMatches.delete(matchId);
-  }, 10000);
+  }, MATCH_CLEANUP_DELAY);
 }
 
 function findAvailableMatch(region) {
@@ -165,6 +175,23 @@ function findAvailableMatch(region) {
     }
   }
   return null;
+}
+
+function removePlayerFromMatch(userId, matchId) {
+  const match = activeMatches.get(matchId);
+  if (!match) return;
+
+  const playerIndex = match.players.findIndex(p => p.userId === userId);
+  if (playerIndex > -1) {
+    match.players.splice(playerIndex, 1);
+  }
+
+  playerMatches.delete(userId);
+
+  // End match if no players left
+  if (match.players.length === 0) {
+    endMatch(matchId);
+  }
 }
 
 // ============================================
@@ -315,8 +342,18 @@ app.post('/match/queue', verifyToken, (req, res) => {
       return res.status(400).json({ error: 'Invalid region' });
     }
 
+    // Check if player is already in a match
     if (playerMatches.has(req.user.userId)) {
-      return res.status(400).json({ error: 'Already in a match' });
+      const existingMatchId = playerMatches.get(req.user.userId);
+      const existingMatch = activeMatches.get(existingMatchId);
+      
+      // If match is still active, reject the request
+      if (existingMatch && existingMatch.status === 'active') {
+        return res.status(400).json({ error: 'Already in a match' });
+      } else {
+        // Match ended, clean up the old reference
+        playerMatches.delete(req.user.userId);
+      }
     }
 
     const player = {
@@ -338,8 +375,9 @@ app.post('/match/queue', verifyToken, (req, res) => {
       });
     } else {
       // Create new match
-      match = createMatch(region, player);
-      const playerId = Object.keys(match.gameState.players)[0];
+      const newPlayer = { ...player, id: generatePlayerId() };
+      match = createMatch(region, newPlayer);
+      const playerId = newPlayer.id;
       return res.json({
         success: true,
         matchId: match.id,
@@ -406,9 +444,6 @@ app.post('/match/:matchId/update', verifyToken, (req, res) => {
     if (typeof isCrouching === 'boolean') playerState.isCrouching = isCrouching;
     if (typeof isScoped === 'boolean') playerState.isScoped = isScoped;
 
-    // Server handles ammo and HP (client cannot modify directly)
-    // These would be updated based on server-side hit detection and validation
-
     res.json({
       success: true,
       gameState: match.gameState
@@ -444,7 +479,6 @@ app.post('/match/:matchId/fire', verifyToken, (req, res) => {
     playerState.ammo -= 1;
 
     // Server-side hit detection would go here
-    // For now, just register the shot
     const bullet = {
       id: generatePlayerId(),
       playerId: playerId,
@@ -531,14 +565,7 @@ app.post('/match/:matchId/leave', verifyToken, (req, res) => {
       return res.status(404).json({ error: 'Match not found' });
     }
 
-    const playerIndex = match.players.findIndex(p => p.userId === req.user.userId);
-    if (playerIndex === -1) {
-      return res.status(403).json({ error: 'Not in this match' });
-    }
-
-    // Remove player from match
-    match.players.splice(playerIndex, 1);
-    playerMatches.delete(req.user.userId);
+    removePlayerFromMatch(req.user.userId, req.params.matchId);
 
     res.json({ success: true });
   } catch (error) {
