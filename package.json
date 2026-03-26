@@ -1,7 +1,7 @@
 {
   "name": "moborr-backend",
   "version": "1.0.0",
-  "description": "Moborr.io Backend API",
+  "description": "Moborr.io Backend API + Game Server",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -13,9 +13,10 @@
     "cors": "^2.8.5",
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2",
-    "@supabase/supabase-js": "^2.38.4"
+    "@supabase/supabase-js": "^2.38.4",
+    "ws": "^8.14.2"
   },
   "engines": {
-  "node": "20.x"
+    "node": "20.x"
   }
 }
