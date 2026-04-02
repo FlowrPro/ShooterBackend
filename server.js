@@ -1,5 +1,5 @@
 // ===========================
-// Moborr.io Server (Auth + Characters)
+// Moborr.io Server (Auth + Characters + Game)
 // ===========================
 
 import express from 'express';
@@ -7,6 +7,8 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { createClient } from '@supabase/supabase-js';
+import { WebSocketServer } from 'ws';
+import { createServer } from 'http';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -47,7 +49,7 @@ function authenticate(req, res, next) {
 }
 
 // ============================================
-// AUTH ROUTES (unchanged behavior)
+// AUTH ROUTES
 // ============================================
 
 app.post('/auth/register', async (req, res) => {
@@ -172,9 +174,7 @@ app.get('/auth/me', (req, res) => {
 });
 
 // ============================================
-// CHARACTER ENDPOINTS (new)
-// - GET /characters         -> returns array length 3 with character objects or null for empty slots
-// - POST /characters        -> create/update a character in a slot for the authenticated user
+// CHARACTER ENDPOINTS
 // ============================================
 
 app.get('/characters', authenticate, async (req, res) => {
@@ -190,7 +190,6 @@ app.get('/characters', authenticate, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch characters' });
     }
 
-    // produce array of length 3 (slots 0..2)
     const slots = [null, null, null];
     (data || []).forEach((c) => {
       if (typeof c.slot === 'number' && c.slot >= 0 && c.slot <= 2) {
@@ -219,7 +218,6 @@ app.post('/characters', authenticate, async (req, res) => {
 
     const trimmedName = name.trim();
 
-    // Check if a character already exists in that slot for this user
     const { data: existing, error: selectErr } = await supabase
       .from('characters')
       .select('*')
@@ -233,7 +231,6 @@ app.post('/characters', authenticate, async (req, res) => {
     }
 
     if (existing) {
-      // Update
       const { data: updated, error: updateErr } = await supabase
         .from('characters')
         .update({ name: trimmedName, avatar: avatar ?? existing.avatar, updated_at: new Date() })
@@ -248,7 +245,6 @@ app.post('/characters', authenticate, async (req, res) => {
 
       return res.json({ character: updated });
     } else {
-      // Insert
       const insertPayload = {
         user_id: req.user.id,
         slot,
@@ -276,18 +272,205 @@ app.post('/characters', authenticate, async (req, res) => {
 });
 
 // ============================================
+// GAME CONFIG & STATE
+// ============================================
+
+const GAME_CONFIG = {
+  MAP_WIDTH: 50000,
+  MAP_HEIGHT: 50000,
+  PLAYER_RADIUS: 25,
+  PLAYER_SPEED: 7,
+  TICK_RATE: 60,
+  TICK_DURATION: 1000 / 60
+};
+
+const players = new Map(); // playerId -> { id, username, x, y, inputState, ws, characterName }
+
+// ============================================
+// HTTP SERVER + WEBSOCKET
+// ============================================
+
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+function updatePlayerPhysics() {
+  players.forEach((player) => {
+    const input = player.inputState;
+    const speed = GAME_CONFIG.PLAYER_SPEED;
+
+    if (input.w) {
+      player.y = Math.max(GAME_CONFIG.PLAYER_RADIUS, player.y - speed);
+    }
+    if (input.s) {
+      player.y = Math.min(GAME_CONFIG.MAP_HEIGHT - GAME_CONFIG.PLAYER_RADIUS, player.y + speed);
+    }
+    if (input.a) {
+      player.x = Math.max(GAME_CONFIG.PLAYER_RADIUS, player.x - speed);
+    }
+    if (input.d) {
+      player.x = Math.min(GAME_CONFIG.MAP_WIDTH - GAME_CONFIG.PLAYER_RADIUS, player.x + speed);
+    }
+  });
+}
+
+function broadcastGameState() {
+  const gameState = {
+    type: 'playerUpdate',
+    players: Array.from(players.values()).map((p) => ({
+      id: p.id,
+      username: p.username,
+      characterName: p.characterName,
+      x: p.x,
+      y: p.y,
+      avatar: p.avatar
+    }))
+  };
+
+  players.forEach((player) => {
+    if (player.ws.readyState === 1) {
+      player.ws.send(JSON.stringify(gameState));
+    }
+  });
+}
+
+function gameServerLoop() {
+  updatePlayerPhysics();
+  broadcastGameState();
+}
+
+setInterval(gameServerLoop, GAME_CONFIG.TICK_DURATION);
+
+// WebSocket connection handler
+wss.on('connection', (ws) => {
+  console.log('🟢 New WebSocket connection');
+
+  let player = null;
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data);
+
+      if (message.type === 'join') {
+        try {
+          const decoded = jwt.verify(message.token, JWT_SECRET);
+          const playerId = decoded.userId;
+
+          if (players.has(playerId)) {
+            player = players.get(playerId);
+            player.ws = ws;
+          } else {
+            player = {
+              id: playerId,
+              username: message.username,
+              characterName: message.characterName,
+              avatar: message.avatar,
+              x: GAME_CONFIG.MAP_WIDTH / 2 + Math.random() * 200 - 100,
+              y: GAME_CONFIG.MAP_HEIGHT / 2 + Math.random() * 200 - 100,
+              inputState: { w: false, a: false, s: false, d: false },
+              ws
+            };
+            players.set(playerId, player);
+          }
+
+          const gameState = {
+            type: 'gameState',
+            config: GAME_CONFIG,
+            you: {
+              id: player.id,
+              username: player.username,
+              characterName: player.characterName,
+              x: player.x,
+              y: player.y,
+              avatar: player.avatar
+            },
+            players: Array.from(players.values())
+              .filter((p) => p.id !== playerId)
+              .map((p) => ({
+                id: p.id,
+                username: p.username,
+                characterName: p.characterName,
+                x: p.x,
+                y: p.y,
+                avatar: p.avatar
+              }))
+          };
+
+          ws.send(JSON.stringify(gameState));
+
+          const joinMessage = {
+            type: 'playerJoined',
+            playerId: player.id,
+            username: player.username,
+            characterName: player.characterName,
+            x: player.x,
+            y: player.y,
+            avatar: player.avatar
+          };
+
+          players.forEach((p) => {
+            if (p.id !== playerId && p.ws.readyState === 1) {
+              p.ws.send(JSON.stringify(joinMessage));
+            }
+          });
+
+          console.log(`✅ Player ${player.characterName} (${player.username}) joined. Total: ${players.size}`);
+        } catch (error) {
+          console.error('Token verification failed:', error);
+          ws.close(1008, 'Unauthorized');
+        }
+      } else if (message.type === 'move') {
+        if (player) {
+          player.inputState = {
+            w: message.w === true,
+            a: message.a === true,
+            s: message.s === true,
+            d: message.d === true
+          };
+        }
+      }
+    } catch (error) {
+      console.error('WebSocket message error:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    if (player) {
+      console.log(`👋 Player ${player.characterName} (${player.username}) disconnected`);
+
+      const leftMessage = {
+        type: 'playerLeft',
+        playerId: player.id
+      };
+
+      players.forEach((p) => {
+        if (p.id !== player.id && p.ws.readyState === 1) {
+          p.ws.send(JSON.stringify(leftMessage));
+        }
+      });
+
+      players.delete(player.id);
+    }
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    message: 'Moborr server running (game disabled)',
-    playersOnline: 0
+    message: 'Moborr server running',
+    playersOnline: players.size
   });
 });
 
-// Start server (no WebSocket)
-app.listen(PORT, () => {
+// Start server
+server.listen(PORT, () => {
   console.log(`🚀 Moborr Server running on http://localhost:${PORT}`);
+  console.log(`📡 WebSocket available at ws://localhost:${PORT}`);
 });
