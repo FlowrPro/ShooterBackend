@@ -1,6 +1,5 @@
 // ===========================
-// Moborr.io Server (Auth only)
-// Minimal server: Auth + Health endpoints. Game / WebSocket removed for now.
+// Moborr.io Server (Auth + Characters)
 // ===========================
 
 import express from 'express';
@@ -28,9 +27,27 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 app.use(cors());
 app.use(express.json());
 
+// ----------------------------
+// Helper: authenticate middleware
+// ----------------------------
+function authenticate(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = { id: decoded.userId, username: decoded.username };
+    return next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
 // ============================================
-// AUTH ROUTES
-// (kept intact from previous implementation)
+// AUTH ROUTES (unchanged behavior)
 // ============================================
 
 app.post('/auth/register', async (req, res) => {
@@ -151,6 +168,110 @@ app.get('/auth/me', (req, res) => {
     });
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+// ============================================
+// CHARACTER ENDPOINTS (new)
+// - GET /characters         -> returns array length 3 with character objects or null for empty slots
+// - POST /characters        -> create/update a character in a slot for the authenticated user
+// ============================================
+
+app.get('/characters', authenticate, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('characters')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('slot', { ascending: true });
+
+    if (error) {
+      console.error('Supabase select characters error:', error);
+      return res.status(500).json({ error: 'Failed to fetch characters' });
+    }
+
+    // produce array of length 3 (slots 0..2)
+    const slots = [null, null, null];
+    (data || []).forEach((c) => {
+      if (typeof c.slot === 'number' && c.slot >= 0 && c.slot <= 2) {
+        slots[c.slot] = c;
+      }
+    });
+
+    return res.json({ characters: slots });
+  } catch (err) {
+    console.error('GET /characters error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/characters', authenticate, async (req, res) => {
+  try {
+    const { slot, name, avatar } = req.body;
+
+    if (typeof slot !== 'number' || slot < 0 || slot > 2) {
+      return res.status(400).json({ error: 'Invalid slot (must be 0,1,2)' });
+    }
+
+    if (!name || typeof name !== 'string' || name.trim().length < 2) {
+      return res.status(400).json({ error: 'Invalid name (min 2 characters)' });
+    }
+
+    const trimmedName = name.trim();
+
+    // Check if a character already exists in that slot for this user
+    const { data: existing, error: selectErr } = await supabase
+      .from('characters')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .eq('slot', slot)
+      .maybeSingle();
+
+    if (selectErr) {
+      console.error('Supabase select character error:', selectErr);
+      return res.status(500).json({ error: 'Failed to check existing character' });
+    }
+
+    if (existing) {
+      // Update
+      const { data: updated, error: updateErr } = await supabase
+        .from('characters')
+        .update({ name: trimmedName, avatar: avatar ?? existing.avatar, updated_at: new Date() })
+        .eq('id', existing.id)
+        .select()
+        .single();
+
+      if (updateErr) {
+        console.error('Supabase update character error:', updateErr);
+        return res.status(500).json({ error: 'Failed to update character' });
+      }
+
+      return res.json({ character: updated });
+    } else {
+      // Insert
+      const insertPayload = {
+        user_id: req.user.id,
+        slot,
+        name: trimmedName,
+        avatar: avatar ?? '😎'
+      };
+
+      const { data: created, error: insertErr } = await supabase
+        .from('characters')
+        .insert([insertPayload])
+        .select()
+        .single();
+
+      if (insertErr) {
+        console.error('Supabase insert character error:', insertErr);
+        return res.status(500).json({ error: 'Failed to create character' });
+      }
+
+      return res.status(201).json({ character: created });
+    }
+  } catch (err) {
+    console.error('POST /characters error:', err);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
