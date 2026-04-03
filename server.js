@@ -279,12 +279,14 @@ const GAME_CONFIG = {
   MAP_WIDTH: 50000,
   MAP_HEIGHT: 50000,
   PLAYER_RADIUS: 25,
-  PLAYER_SPEED: 7,
+  PLAYER_SPEED: 200, // pixels per second
   TICK_RATE: 60,
-  TICK_DURATION: 1000 / 60
+  TICK_DURATION: 1000 / 60,
+  MAX_POSITION_DIFF: 500 // Max distance player can move in one tick (anti-cheat)
 };
 
-const players = new Map(); // playerId -> { id, username, x, y, inputState, ws, characterName }
+const players = new Map(); // playerId -> { id, username, x, y, vx, vy, inputState, ws, characterName, lastUpdateTime }
+let lastTickTime = Date.now();
 
 // ============================================
 // HTTP SERVER + WEBSOCKET
@@ -293,23 +295,50 @@ const players = new Map(); // playerId -> { id, username, x, y, inputState, ws, 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-function updatePlayerPhysics() {
+function updatePlayerPhysics(deltaTime) {
+  const dt = deltaTime / 1000; // Convert to seconds
+  
   players.forEach((player) => {
     const input = player.inputState;
     const speed = GAME_CONFIG.PLAYER_SPEED;
 
-    if (input.w) {
-      player.y = Math.max(GAME_CONFIG.PLAYER_RADIUS, player.y - speed);
+    // Calculate target velocity
+    let vx = 0;
+    let vy = 0;
+
+    if (input.w) vy -= speed;
+    if (input.s) vy += speed;
+    if (input.a) vx -= speed;
+    if (input.d) vx += speed;
+
+    // Normalize diagonal movement
+    const magnitude = Math.sqrt(vx * vx + vy * vy);
+    if (magnitude > speed) {
+      vx = (vx / magnitude) * speed;
+      vy = (vy / magnitude) * speed;
     }
-    if (input.s) {
-      player.y = Math.min(GAME_CONFIG.MAP_HEIGHT - GAME_CONFIG.PLAYER_RADIUS, player.y + speed);
-    }
-    if (input.a) {
-      player.x = Math.max(GAME_CONFIG.PLAYER_RADIUS, player.x - speed);
-    }
-    if (input.d) {
-      player.x = Math.min(GAME_CONFIG.MAP_WIDTH - GAME_CONFIG.PLAYER_RADIUS, player.x + speed);
-    }
+
+    // Smooth velocity interpolation
+    const acceleration = 0.15;
+    const friction = 0.92;
+    
+    player.vx += (vx - player.vx) * acceleration;
+    player.vy += (vy - player.vy) * acceleration;
+    
+    player.vx *= friction;
+    player.vy *= friction;
+
+    // Stop if velocity is very small
+    if (Math.abs(player.vx) < 0.5) player.vx = 0;
+    if (Math.abs(player.vy) < 0.5) player.vy = 0;
+
+    // Update position
+    const newX = player.x + player.vx * dt;
+    const newY = player.y + player.vy * dt;
+
+    // Clamp to map bounds
+    player.x = Math.max(GAME_CONFIG.PLAYER_RADIUS, Math.min(GAME_CONFIG.MAP_WIDTH - GAME_CONFIG.PLAYER_RADIUS, newX));
+    player.y = Math.max(GAME_CONFIG.PLAYER_RADIUS, Math.min(GAME_CONFIG.MAP_HEIGHT - GAME_CONFIG.PLAYER_RADIUS, newY));
   });
 }
 
@@ -334,7 +363,11 @@ function broadcastGameState() {
 }
 
 function gameServerLoop() {
-  updatePlayerPhysics();
+  const now = Date.now();
+  const deltaTime = now - lastTickTime;
+  lastTickTime = now;
+
+  updatePlayerPhysics(deltaTime);
   broadcastGameState();
 }
 
@@ -366,8 +399,11 @@ wss.on('connection', (ws) => {
               avatar: message.avatar,
               x: GAME_CONFIG.MAP_WIDTH / 2 + Math.random() * 200 - 100,
               y: GAME_CONFIG.MAP_HEIGHT / 2 + Math.random() * 200 - 100,
+              vx: 0,
+              vy: 0,
               inputState: { w: false, a: false, s: false, d: false },
-              ws
+              ws,
+              lastUpdateTime: Date.now()
             };
             players.set(playerId, player);
           }
@@ -420,12 +456,26 @@ wss.on('connection', (ws) => {
         }
       } else if (message.type === 'move') {
         if (player) {
+          // Validate position (anti-cheat)
+          if (message.x !== undefined && message.y !== undefined) {
+            const dx = Math.abs(message.x - player.x);
+            const dy = Math.abs(message.y - player.y);
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            
+            // Only update if movement is reasonable
+            if (distance < GAME_CONFIG.MAX_POSITION_DIFF) {
+              player.x = message.x;
+              player.y = message.y;
+            }
+          }
+
           player.inputState = {
             w: message.w === true,
             a: message.a === true,
             s: message.s === true,
             d: message.d === true
           };
+          player.lastUpdateTime = Date.now();
         }
       }
     } catch (error) {
